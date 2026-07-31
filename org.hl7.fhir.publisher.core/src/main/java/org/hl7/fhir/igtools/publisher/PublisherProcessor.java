@@ -40,6 +40,14 @@ import java.io.ByteArrayInputStream;
 import java.io.FileNotFoundException;
 import java.io.IOException;
 import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.CopyOnWriteArrayList;
+import org.hl7.fhir.validation.instance.InstanceValidator;
 
 import static org.hl7.fhir.igtools.publisher.Publisher.FMM_DERIVATION_MAX;
 
@@ -48,6 +56,14 @@ import static org.hl7.fhir.igtools.publisher.Publisher.FMM_DERIVATION_MAX;
  */
 
 public class PublisherProcessor extends PublisherBase  {
+
+  /**
+   * Per-thread InstanceValidator pool. Each thread gets its own validator
+   * sharing the same read-only IWorkerContext, avoiding contention on
+   * setExample() / setNoCheckAggregation() during parallel validation.
+   */
+  private ThreadLocal<InstanceValidator> threadValidator;
+
   public PublisherProcessor(PublisherSettings settings) {
     super(settings);
   }
@@ -478,6 +494,35 @@ public class PublisherProcessor extends PublisherBase  {
   }
 
 
+  /**
+   * Create a per-thread copy of the primary InstanceValidator.
+   * All copies share the same read-only IWorkerContext; only per-call
+   * mutable flags (setExample, setNoCheckAggregation) differ per thread.
+   */
+  private InstanceValidator createValidatorCopy() {
+    // getFetcher() returns IValidatorResourceFetcher; constructor expects IHostApplicationServices.
+    // Pass null here - fetcher/policyAdvisor are set below via setFetcher()/setPolicyAdvisor().
+    InstanceValidator v = new InstanceValidator(
+        pf.context, null, pf.context.getXVer(),
+        pf.validatorSession, pf.validator.getSettings());
+    v.setAllowXsiLocation(pf.validator.isAllowXsiLocation());
+    v.setNoBindingMsgSuppressed(pf.validator.isNoBindingMsgSuppressed());
+    v.setNoExtensibleWarnings(pf.validator.isNoExtensibleWarnings());
+    v.setHintAboutNonMustSupport(pf.validator.isHintAboutNonMustSupport());
+    v.setAnyExtensionsAllowed(pf.validator.isAnyExtensionsAllowed());
+    v.setAllowExamples(true);
+    v.setCrumbTrails(true);
+    v.setWantCheckSnapshotUnchanged(true);
+    v.setForPublication(true);
+    v.setEnforceAggregationOutsideBundles(false);
+    v.setShowMessagesFromReferences(pf.validator.isShowMessagesFromReferences());
+    v.setNoExperimentalContent(pf.validator.isNoExperimentalContent());
+    v.getExtensionDomains().addAll(pf.validator.getExtensionDomains());
+    v.setFetcher(pf.validationFetcher);
+    v.setPolicyAdvisor(pf.validationFetcher);
+    return v;
+  }
+
   public void validate() throws Exception {
     if (settings.isValidationOff()) {
       return;
@@ -486,45 +531,65 @@ public class PublisherProcessor extends PublisherBase  {
     checkURLsUnique();
     checkOIDsUnique();
 
+    // Initialise per-thread validator pool once, lazily per thread
+    threadValidator = ThreadLocal.withInitial(this::createValidatorCopy);
+
+    int nThreads = Math.max(1, Runtime.getRuntime().availableProcessors() - 1);
+    ExecutorService pool = Executors.newFixedThreadPool(nThreads);
+    AtomicReference<Exception> firstError = new AtomicReference<>();
+
     for (FetchedFile f : pf.changeList) {
-      f.start("validate");
-      try {
-        logDebugMessage(LogCategory.PROGRESS, " .. validate "+f.getName());
-        logDebugMessage(LogCategory.PROGRESS, " .. "+f.getName());
-        if (!f.getResources().isEmpty()) {
-          FetchedResource r0 = f.getResources().get(0);
-          if (f.getLogical() != null && f.getResources().size() == 1 && !r0.fhirType().equals("Binary")) {
-            throw new Error("Not done yet");
-          } else {
-            for (FetchedResource r : f.getResources()) {
-              if (!r.isValidated()) {
-                logDebugMessage(LogCategory.PROGRESS, "     validating " + r.getTitle());
-//              log("     validating "+r.getTitle());
-                validate(f, r);
+      pool.submit(() -> {
+        f.start("validate");
+        try {
+          logDebugMessage(LogCategory.PROGRESS, " .. validate " + f.getName());
+          if (!f.getResources().isEmpty()) {
+            FetchedResource r0 = f.getResources().get(0);
+            if (f.getLogical() != null && f.getResources().size() == 1 && !r0.fhirType().equals("Binary")) {
+              throw new Error("Not done yet");
+            } else {
+              for (FetchedResource r : f.getResources()) {
+                if (!r.isValidated()) {
+                  logDebugMessage(LogCategory.PROGRESS, "     validating " + r.getTitle());
+                  validateParallel(f, r);
+                }
               }
-            }
-            if (f.getLogical() != null && f.getResources().size() == 1 && r0.fhirType().equals("Binary")) {
-              Binary bin = (Binary) r0.getResource();
-              StructureDefinition profile = this.pf.context.fetchResource(StructureDefinition.class, f.getLogical());
-              List<ValidationMessage> errs = new ArrayList<ValidationMessage>();
-              if (profile == null) {
-                errs.add(new ValidationMessage(ValidationMessage.Source.InstanceValidator, ValidationMessage.IssueType.NOTFOUND, "file", this.pf.context.formatMessage(I18nConstants.Bundle_BUNDLE_Entry_NO_LOGICAL_EXPL, r0.getId(), f.getLogical()), ValidationMessage.IssueSeverity.ERROR));
-              } else {
-                Manager.FhirFormat fmt = Manager.FhirFormat.readFromMimeType(bin.getContentType() == null ? f.getContentType() : bin.getContentType());
-                TimeTracker.Session tts = this.pf.tt.start("validation");
-                List<StructureDefinition> profiles = new ArrayList<>();
-                profiles.add(profile);
-                validate(f, r0, bin, errs, fmt, profiles);
-                tts.end();
+              if (f.getLogical() != null && f.getResources().size() == 1 && r0.fhirType().equals("Binary")) {
+                Binary bin = (Binary) r0.getResource();
+                StructureDefinition profile = pf.context.fetchResource(StructureDefinition.class, f.getLogical());
+                List<ValidationMessage> errs = new ArrayList<>();
+                if (profile == null) {
+                  errs.add(new ValidationMessage(ValidationMessage.Source.InstanceValidator,
+                      ValidationMessage.IssueType.NOTFOUND, "file",
+                      pf.context.formatMessage(I18nConstants.Bundle_BUNDLE_Entry_NO_LOGICAL_EXPL,
+                          r0.getId(), f.getLogical()),
+                      ValidationMessage.IssueSeverity.ERROR));
+                } else {
+                  Manager.FhirFormat fmt = Manager.FhirFormat.readFromMimeType(
+                      bin.getContentType() == null ? f.getContentType() : bin.getContentType());
+                  List<StructureDefinition> profiles = new ArrayList<>();
+                  profiles.add(profile);
+                  InstanceValidator v = threadValidator.get();
+                  v.setExample(r0.isExample());
+                  r0.setLogicalElement(v.validate(r0.getElement(), errs,
+                      new ByteArrayInputStream(bin.getContent()), fmt, profiles));
+                }
+                processValidationOutcomes(f, r0, errs);
               }
-              processValidationOutcomes(f, r0, errs);
             }
           }
+        } catch (Exception e) {
+          firstError.compareAndSet(null, e);
+        } finally {
+          f.finish("validate");
         }
-      } finally {
-        f.finish("validate");
-      }
+      });
     }
+
+    pool.shutdown();
+    pool.awaitTermination(2, TimeUnit.HOURS);
+    if (firstError.get() != null) throw firstError.get();
+
     logDebugMessage(LogCategory.PROGRESS, " .. check Profile Examples");
     logDebugMessage(LogCategory.PROGRESS, "gen narratives");
     for (FetchedFile f : pf.fileList) {
@@ -1208,10 +1273,18 @@ public class PublisherProcessor extends PublisherBase  {
   public void generateNarratives(boolean isRegen) throws Exception {
     TimeTracker.Session tts = pf.tt.start("narrative generation");
     logDebugMessage(LogCategory.PROGRESS, isRegen ? "regen narratives" : "gen narratives");
+
+    int nThreads = Math.max(1, Runtime.getRuntime().availableProcessors() - 1);
+    ExecutorService narrPool = Executors.newFixedThreadPool(nThreads);
+    AtomicReference<Exception> narrError = new AtomicReference<>();
+    // needsRegen written from multiple threads - use AtomicBoolean wrapper
+    AtomicBoolean needsRegenAtomic = new AtomicBoolean(pf.needsRegen);
+
     for (FetchedFile f : pf.changeList) {
-      f.start("generateNarratives");
-      try {
-        for (FetchedResource r : f.getResources()) {
+      narrPool.submit(() -> {
+        f.start("generateNarratives");
+        try {
+          for (FetchedResource r : f.getResources()) {
           if (!isRegen || r.isRegenAfterValidation()) {
             if (r.getExampleUri()==null || this.pf.genExampleNarratives) {
               if (!passesNarrativeFilter(r)) {
@@ -1242,7 +1315,7 @@ public class PublisherProcessor extends PublisherBase  {
                       ResourceRenderer rr = RendererFactory.factory(r.getResource(), lrc);
                       if (rr.renderingUsesValidation()) {
                         r.setRegenAfterValidation(true);
-                        this.pf.needsRegen = true;
+                        needsRegenAtomic.set(true);
                       }
                       rr.setMultiLangMode(langs.size() > 1).renderResource(ResourceWrapper.forResource(lrc, r.getResource()));
                     } else if (r.getResource() instanceof Bundle) {
@@ -1279,10 +1352,10 @@ public class PublisherProcessor extends PublisherBase  {
                       ResourceRenderer rr = RendererFactory.factory(rw, lrc);
                       if (rr.renderingUsesValidation()) {
                         r.setRegenAfterValidation(true);
-                        this.pf.needsRegen = true;
+                        needsRegenAtomic.set(true);
                       }
                       rr.setMultiLangMode(langs.size() > 1).renderResource(rw);
-                      this.pf.otherFilesRun.addAll(lrc.getFiles());
+                      synchronized (pf.otherFilesRun) { pf.otherFilesRun.addAll(lrc.getFiles()); }
                     } else if (r.fhirType().equals("Bundle")) {
                       lrc.setAddName(true);
                       for (org.hl7.fhir.r5.elementmodel.Element e : r.getElement().getChildrenByName("entry")) {
@@ -1292,7 +1365,7 @@ public class PublisherProcessor extends PublisherBase  {
                           ResourceRenderer rr = RendererFactory.factory(rw, lrc);
                           if (rr.renderingUsesValidation()) {
                             r.setRegenAfterValidation(true);
-                            this.pf.needsRegen = true;
+                            needsRegenAtomic.set(true);
                           }
                           if (hasNarrative(res)) {
                             rr.checkNarrative(rw);
@@ -1312,10 +1385,23 @@ public class PublisherProcessor extends PublisherBase  {
             }
           }
         }
-      } finally {
-        f.finish("generateNarratives");
-      }
+        } catch (Exception e) {
+            narrError.compareAndSet(null, e);
+          } finally {
+            f.finish("generateNarratives");
+          }
+        });  // end pool.submit
     }
+
+    narrPool.shutdown();
+    try {
+      narrPool.awaitTermination(2, TimeUnit.HOURS);
+    } catch (InterruptedException e) {
+      Thread.currentThread().interrupt();
+      throw new Exception("Narrative generation interrupted", e);
+    }
+    if (narrError.get() != null) throw narrError.get();
+    pf.needsRegen = needsRegenAtomic.get();
     tts.end();
   }
 
@@ -1686,6 +1772,74 @@ public class PublisherProcessor extends PublisherBase  {
     }
   }
 
+  /**
+   * Thread-safe validate: uses per-thread InstanceValidator from threadValidator ThreadLocal.
+   * Errors are collected locally and merged into FetchedFile/FetchedResource under synchronization.
+   */
+  private void validateParallel(FetchedFile file, FetchedResource r) throws Exception {
+    if (!passesValidationFilter(r)) {
+      synchronized (pf.noValidateResources) { pf.noValidateResources.add(r); }
+      return;
+    }
+    if ("ImplementationGuide".equals(r.fhirType()) && !pf.unknownParams.isEmpty()) {
+      synchronized (file) {
+        file.getErrors().add(new ValidationMessage(ValidationMessage.Source.Publisher,
+            ValidationMessage.IssueType.INVALID, file.getName(),
+            "Unknown Parameters: " + pf.unknownParams.toString(), ValidationMessage.IssueSeverity.WARNING));
+      }
+    }
+
+    List<ValidationMessage> errs = new ArrayList<>();
+    r.getElement().setUserData(UserDataNames.pub_context_file, file);
+    r.getElement().setUserData(UserDataNames.pub_context_resource, r);
+
+    InstanceValidator v = threadValidator.get();
+    v.setExample(r.isExample());
+    if (r.isValidateAsResource()) {
+      Resource res = r.getResource();
+      if (res instanceof Bundle) {
+        v.validate(r.getElement(), errs, null, r.getElement());
+        for (Bundle.BundleEntryComponent be : ((Bundle) res).getEntry()) {
+          Resource ber = be.getResource();
+          if (ber.hasUserData(UserDataNames.map_profile)) {
+            v.validate(r.getElement(), errs, ber, ber.getUserString(UserDataNames.map_profile));
+          }
+        }
+      } else if (res.hasUserData(UserDataNames.map_profile)) {
+        v.validate(r.getElement(), errs, res, res.getUserString(UserDataNames.map_profile));
+      }
+    } else if (r.getResource() != null && r.getResource() instanceof Binary && file.getLogical() != null
+        && pf.context.hasResource(StructureDefinition.class, file.getLogical())) {
+      StructureDefinition sd = pf.context.fetchResource(StructureDefinition.class, file.getLogical());
+      Binary bin = (Binary) r.getResource();
+      List<StructureDefinition> profiles = new ArrayList<>();
+      profiles.add(sd);
+      v.validate(r.getElement(), errs, new ByteArrayInputStream(bin.getContent()),
+          Manager.FhirFormat.readFromMimeType(bin.getContentType() == null ? file.getContentType() : bin.getContentType()),
+          profiles);
+    } else if (r.getResource() != null && r.getResource() instanceof Binary && r.getExampleUri() != null) {
+      Binary bin = (Binary) r.getResource();
+      v.validate(r.getElement(), errs, new ByteArrayInputStream(bin.getContent()),
+          Manager.FhirFormat.readFromMimeType(bin.getContentType() == null ? file.getContentType() : bin.getContentType()));
+    } else {
+      v.setNoCheckAggregation(r.isExample() && ExtensionUtilities.readBoolExtension(r.getResEntry(),
+          "http://hl7.org/fhir/tools/StructureDefinition/igpublisher-no-check-aggregation"));
+      List<StructureDefinition> profiles = new ArrayList<>();
+      if (r.getElement().hasUserData(UserDataNames.map_profile)) {
+        addProfile(profiles, r.getElement().getUserString(UserDataNames.map_profile), null);
+      }
+      for (String s : r.getProfiles(false)) {
+        addProfile(profiles, s, r.fhirType());
+      }
+      v.validate(r.getElement(), errs, null, r.getElement(), profiles);
+    }
+    processValidationOutcomes(file, r, errs);
+    r.setValidated(true);
+    if (r.getConfig() == null) {
+      pf.igpkp.findConfiguration(file, r);
+    }
+  }
+
   private void validate(FetchedFile file, FetchedResource r) throws Exception {
     if (!passesValidationFilter(r)) {
       pf.noValidateResources.add(r);
@@ -1742,15 +1896,19 @@ public class PublisherProcessor extends PublisherBase  {
   }
 
   private void processValidationOutcomes(FetchedFile file, FetchedResource r, List<ValidationMessage> errs) {
-    for (ValidationMessage vm : errs) {
-      String loc = r.fhirType()+"/"+r.getId();
-      if (!vm.getLocation().startsWith(loc)) {
-        vm.setLocation(loc+": "+vm.getLocation());
+    if (errs.isEmpty()) return;
+    // Synchronize on the file object so concurrent threads don't corrupt the per-file error list
+    synchronized (file) {
+      for (ValidationMessage vm : errs) {
+        String loc = r.fhirType() + "/" + r.getId();
+        if (!vm.getLocation().startsWith(loc)) {
+          vm.setLocation(loc + ": " + vm.getLocation());
+        }
+        if (!alreadyExists(file.getErrors(), vm)) {
+          file.getErrors().add(vm);
+        }
+        r.getErrors().add(vm);
       }
-      if (!alreadyExists(file.getErrors(), vm)) {
-        file.getErrors().add(vm);
-      }
-      r.getErrors().add(vm);
     }
   }
 

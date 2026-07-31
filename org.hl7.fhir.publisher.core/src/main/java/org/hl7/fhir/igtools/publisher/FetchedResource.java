@@ -92,6 +92,12 @@ public class FetchedResource {
   private boolean umlGenerated;
   @Getter @Setter private boolean generatedNarrative; // if we generate the narrative, we'll regenerate it later
 
+  /** Temporary buffer for native JSON output when generating in parallel (flushed to DB sequentially). */
+  private volatile byte[] nativeJson;
+  public byte[] getNativeJson() { return nativeJson; }
+  public void setNativeJson(byte[] json) { this.nativeJson = json; }
+  public void clearNativeJson() { this.nativeJson = null; }
+
   public FetchedResource(String nameForErrors) {
     super();
     this.nameForErrors = nameForErrors;

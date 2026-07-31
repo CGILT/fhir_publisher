@@ -150,6 +150,21 @@ public class StructureDefinitionRenderer extends CanonicalRenderer {
     this.resE = ResourceWrapper.forResource(gen.getContextUtilities(), sd);
   }
 
+  /**
+   * Reset this renderer to process a different StructureDefinition,
+   * reusing the already-allocated ProfileUtilities and sub-renderer.
+   * Avoids expensive object allocation per SD during parallel generation.
+   */
+  public void resetFor(StructureDefinition newSd, RenderingContext newGen) {
+    this.sd = newSd;
+    super.resetResource(newSd);  // updates CanonicalRenderer.cr
+    this.gen = newGen;           // updates BaseRenderer.gen
+    sdr = new org.hl7.fhir.r5.renderers.StructureDefinitionRenderer(newGen);
+    sdr.setSdMapCache(sdMapCache);
+    sdr.setHostMd(this);
+    this.resE = ResourceWrapper.forResource(newGen.getContextUtilities(), newSd);
+  }
+
   public String summary(boolean all) {
     try {
       if (sd.hasExtension(ExtensionDefinitions.EXT_SUMMARY)) {

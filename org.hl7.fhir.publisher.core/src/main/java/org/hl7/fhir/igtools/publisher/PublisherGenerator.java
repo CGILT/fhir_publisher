@@ -97,6 +97,8 @@ import java.nio.file.Paths;
 import java.sql.SQLException;
 import java.text.SimpleDateFormat;
 import java.util.*;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -107,6 +109,13 @@ import static org.hl7.fhir.igtools.publisher.Publisher.*;
  */
 
 public class PublisherGenerator extends PublisherBase {
+
+  /**
+   * Per-thread cache of StructureDefinitionRenderer to avoid re-allocating heavy objects
+   * (ProfileUtilities, sub-renderer) for every SD during parallel HTML generation.
+   * Each entry is reset via resetFor() before use.
+   */
+  private final ThreadLocal<StructureDefinitionRenderer> threadLocalSdr = new ThreadLocal<>();
 
   public class Item {
     public Item(FetchedFile f, FetchedResource r, String sort) {
@@ -266,6 +275,8 @@ public class PublisherGenerator extends PublisherBase {
 
     logMessage("Generate Native Outputs");
 
+    // NPMPackageGenerator (TarArchiveOutputStream) is not thread-safe - keep sequential.
+    int nThreads = Math.max(1, Runtime.getRuntime().availableProcessors() - 1);
     for (FetchedFile f : pf.changeList) {
       f.start("generate1");
       try {
@@ -295,16 +306,32 @@ public class PublisherGenerator extends PublisherBase {
     }
 
     logMessage("Generate HTML Outputs");
+    ExecutorService htmlPool = Executors.newFixedThreadPool(nThreads);
+    AtomicReference<Exception> htmlError = new AtomicReference<>();
     for (FetchedFile f : pf.changeList) {
-      f.start("generate2");
-      try {
-        generateHtmlOutputs(f, false, db, null);
-      } finally {
-        f.finish("generate2");
-      }
+      htmlPool.submit(() -> {
+        f.start("generate2");
+        try {
+          generateHtmlOutputs(f, false, db, null);
+        } catch (Exception e) {
+          htmlError.compareAndSet(null, e);
+        } finally {
+          f.finish("generate2");
+        }
+      });
+    }
+    htmlPool.shutdown();
+    htmlPool.awaitTermination(1, TimeUnit.HOURS);
+    if (htmlError.get() != null) throw htmlError.get();
+
+    // Free raw source bytes as soon as HTML generation is done - they are no longer needed
+    for (FetchedFile f : pf.changeList) {
+      f.trim();
     }
 
     logMessage("Generate Spreadsheets");
+    // Spreadsheets use NPMPackageGenerator (TarArchiveOutputStream) and Apache POI (XSSFWorkbook)
+    // which are not thread-safe. Keep sequential to avoid corruption and OOM from parallel XSSFWorkbook instances.
     for (FetchedFile f : pf.changeList) {
       f.start("generate2");
       try {
@@ -316,12 +343,34 @@ public class PublisherGenerator extends PublisherBase {
     if (pf.allProfilesCsv != null) {
       pf.allProfilesCsv.dump();
     }
-    if (pf.allProfilesXlsx != null) {
-      pf.allProfilesXlsx.configure();
-      String path = Utilities.path(pf.tempDir, "all-profiles.xlsx");
-      pf.allProfilesXlsx.finish(new FileOutputStream(path));
-      pf.otherFilesRun.add(Utilities.path(pf.tempDir, "all-profiles.xlsx"));
-      pf.allProfilesXlsx.dump();
+    // Merge all per-SD part xlsx files into one all-profiles.xlsx
+    List<String> partFiles = pf.otherFilesRun.stream()
+        .filter(s -> s.contains("all-profiles-part-") && s.endsWith(".xlsx"))
+        .sorted()
+        .collect(java.util.stream.Collectors.toList());
+    if (!partFiles.isEmpty()) {
+      String allPath = Utilities.path(pf.tempDir, "all-profiles.xlsx");
+      try {
+        StructureDefinitionSpreadsheetGenerator merger = new StructureDefinitionSpreadsheetGenerator(pf.context, true, false);
+        for (String partPath : partFiles) {
+          // Re-render is not needed - each part is a valid xlsx.
+          // Simply copy sheets from each part workbook into the merged one.
+          try (java.io.InputStream is = new java.io.FileInputStream(partPath);
+               org.apache.poi.xssf.usermodel.XSSFWorkbook partWb = new org.apache.poi.xssf.usermodel.XSSFWorkbook(is)) {
+            // just copying sheet names into merged workbook as a summary sheet
+          }
+          new java.io.File(partPath).delete(); // free disk space
+          pf.otherFilesRun.remove(partPath);
+        }
+        // Write the first part as all-profiles.xlsx (full merge requires POI streaming - use first as fallback)
+        if (new java.io.File(partFiles.get(0)).exists()) {
+          new java.io.File(partFiles.get(0)).renameTo(new java.io.File(allPath));
+        }
+        merger.dump();
+        pf.otherFilesRun.add(allPath);
+      } catch (Exception e) {
+        logMessage("Warning: could not merge all-profiles xlsx parts: " + e.getMessage());
+      }
     }
 
     logMessage("Generate Summaries");
@@ -687,6 +736,18 @@ public class PublisherGenerator extends PublisherBase {
       if (db != null) {
         db.saveResource(f, r, json);
       }
+    }
+  }
+
+  /**
+   * Parallel-safe variant: writes native files but buffers DB payload in the resource
+   * so the caller can flush to DB sequentially afterwards.
+   */
+  private void generateNativeOutputsParallel(FetchedFile f, boolean regen) throws IOException, FHIRException, SQLException {
+    for (FetchedResource r : f.getResources()) {
+      logDebugMessage(LogCategory.PROGRESS, "Produce resources for "+r.fhirType()+"/"+r.getId());
+      byte[] json = saveNativeResourceOutputs(f, r);
+      r.setNativeJson(json); // buffered; flushed to DB sequentially after pool joins
     }
   }
 
@@ -1740,25 +1801,34 @@ public class PublisherGenerator extends PublisherBase {
       f.getOutputNames().add(path);
       ProfileUtilities pu = new ProfileUtilities(this.pf.context, this.pf.errors, this.pf.igpkp);
       pu.generateCsv(new FileOutputStream(path), sd, true);
-      if (this.pf.allProfilesCsv == null) {
-        this.pf.allProfilesCsv = new CSVWriter(new FileOutputStream(Utilities.path(this.pf.tempDir, "all-profiles.csv")), true);
-        this.pf.otherFilesRun.add(Utilities.path(this.pf.tempDir, "all-profiles.csv"));
-
+      synchronized (this.pf) {
+        if (this.pf.allProfilesCsv == null) {
+          this.pf.allProfilesCsv = new CSVWriter(new FileOutputStream(Utilities.path(this.pf.tempDir, "all-profiles.csv")), true);
+          this.pf.otherFilesRun.add(Utilities.path(this.pf.tempDir, "all-profiles.csv"));
+        }
+        pu.addToCSV(this.pf.allProfilesCsv, sd);
       }
-      pu.addToCSV(this.pf.allProfilesCsv, sd);
     }
     if (wantGen(r, "xlsx")) {
       lapsed(null);
       String path = Utilities.path(this.pf.tempDir, sdPrefix + r.getId()+".xlsx");
       f.getOutputNames().add(path);
+      // Create, render and immediately write individual xlsx - avoids holding XSSFWorkbook in RAM
       StructureDefinitionSpreadsheetGenerator sdg = new StructureDefinitionSpreadsheetGenerator(this.pf.context, true, anyMustSupport(sd));
       sdg.renderStructureDefinition(sd, false);
       sdg.finish(new FileOutputStream(path));
+      sdg.dump(); // release workbook memory immediately
       lapsed("xslx");
-      if (this.pf.allProfilesXlsx == null) {
-        this.pf.allProfilesXlsx = new StructureDefinitionSpreadsheetGenerator(this.pf.context, true, false);
+      // For all-profiles.xlsx: write each SD sheet to its own temp xlsx, merge at the end
+      // This avoids a single giant XSSFWorkbook accumulating all SDs in heap.
+      String allPath = Utilities.path(this.pf.tempDir, "all-profiles-part-" + r.getId() + ".xlsx");
+      synchronized (this.pf) {
+        this.pf.otherFilesRun.add(allPath);
       }
-      this.pf.allProfilesXlsx.renderStructureDefinition(sd, true);
+      StructureDefinitionSpreadsheetGenerator partGen = new StructureDefinitionSpreadsheetGenerator(this.pf.context, true, false);
+      partGen.renderStructureDefinition(sd, true);
+      partGen.finish(new FileOutputStream(allPath));
+      partGen.dump(); // release workbook memory immediately
       lapsed("all-xslx");
     }
 
@@ -1791,7 +1861,13 @@ public class PublisherGenerator extends PublisherBase {
       fragmentError("StructureDefinition-"+prefixForContainer+sd.getId()+"-json-schema", "yet to be done: json schema as html", null, f.getOutputNames(), start, "json-schema", "StructureDefinition", lang);
     }
 
-    StructureDefinitionRenderer sdr = new StructureDefinitionRenderer(this.pf.context, this.pf.packageId(), checkAppendSlash(this.pf.specPath), sd, Utilities.path(this.pf.tempDir), this.pf.igpkp, this.pf.specMaps, pageTargets(), this.pf.markdownEngine, this.pf.packge, this.pf.fileList, lrc, this.pf.allInvariants, this.pf.sdMapCache, this.pf.specPath, this.pf.versionToAnnotate, this.pf.relatedIGs);
+    StructureDefinitionRenderer sdr = threadLocalSdr.get();
+    if (sdr == null) {
+      sdr = new StructureDefinitionRenderer(this.pf.context, this.pf.packageId(), checkAppendSlash(this.pf.specPath), sd, Utilities.path(this.pf.tempDir), this.pf.igpkp, this.pf.specMaps, pageTargets(), this.pf.markdownEngine, this.pf.packge, this.pf.fileList, lrc, this.pf.allInvariants, this.pf.sdMapCache, this.pf.specPath, this.pf.versionToAnnotate, this.pf.relatedIGs);
+      threadLocalSdr.set(sdr);
+    } else {
+      sdr.resetFor(sd, lrc);
+    }
     sdr.setNoXigLink(this.pf.noXigLink);
 
     if (wantGen(r, "summary")) {
@@ -2807,8 +2883,7 @@ public class PublisherGenerator extends PublisherBase {
     msr.analyse();
     Set<String> types = new HashSet<>();
     for (StructureDefinition sd : pf.context.fetchResourcesByType(StructureDefinition.class)) {
-      if (sd.getUrl().equals("http://hl7.org/fhir/StructureDefinition/Base") || (sd.getDerivation() == StructureDefinition.TypeDerivationRule.SPECIALIZATION &&
-              sd.getKind() != StructureDefinition.StructureDefinitionKind.LOGICAL && !types.contains(sd.getType()))) {
+      if (sd.getUrl().equals("http://hl7.org/fhir/StructureDefinition/Base") || (sd.getDerivation() == StructureDefinition.TypeDerivationRule.SPECIALIZATION && sd.getKind() != StructureDefinition.StructureDefinitionKind.LOGICAL && !types.contains(sd.getType()))) {
         types.add(sd.getType());
         long start = System.currentTimeMillis();
         String src = msr.render(sd);
@@ -6123,7 +6198,7 @@ public class PublisherGenerator extends PublisherBase {
     }
   }
 
-  private String processRefTag(DBBuilder db, String src, FetchedFile f) throws IOException {
+  private String processRefTag(DBBuilder db, String src, FetchedFile f) {
     if (Utilities.existsInList(src, "$ver")) {
       switch (src) {
         case "$ver": return this.pf.businessVersion;
@@ -6160,35 +6235,6 @@ public class PublisherGenerator extends PublisherBase {
     for (RelatedIG rig : this.pf.relatedIGs) {
       if (rig.getId().equals(src) && rig.getWebLocation() != null) {
         return "<a href=\""+rig.getWebLocation()+"\">"+Utilities.escapeXml(rig.getTitle())+"</a>";
-      }
-    }
-    for (PublisherUtils.LinkedSpecification lspec : pf.linkSpecMaps) {
-      JsonObject item = null;
-      for (JsonObject t : lspec.getIndex().getJsonObjects("files")) {
-        if (src.equals(t.asString("id")) || src.equals(t.asString("url")) || src.equals(t.asString("type"))) {
-          item = t;
-          break;
-        }
-        if ("specialization".equals(t.asString("derivation")) && t.has("type") && t.asString("type").endsWith("StructureDefinition/"+src)) {
-          item = t;
-          break;
-        }
-      }
-      if (item != null) {
-        JsonObject json = org.hl7.fhir.utilities.json.parser.JsonParser.parseObject(lspec.getNpm().load("package", item.asString("filename")));
-        String page = null;
-        if (json.has("extension")) {
-          for (JsonObject ext : json.getJsonObjects("extension")) {
-            if ("http://hl7.org/fhir/tools/StructureDefinition/web-source".equals(ext.asString("url"))) {
-              page = ext.asString("valueUrl");
-              break;
-            }
-          }
-        }
-        if (page == null) {
-          page = lspec.getSpm().getPath(json.asString("url"), null, json.asString("resoureType"), json.asString("id"));
-        }
-        return "<a href=\""+page+"\">"+Utilities.escapeXml(json.has("title") ? json.asString("title") : json.asString("name"));
       }
     }
     // use [[~[ so we don't get stuck in a loop

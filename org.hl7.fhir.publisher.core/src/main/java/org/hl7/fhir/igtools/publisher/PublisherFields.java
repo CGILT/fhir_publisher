@@ -36,6 +36,8 @@ import org.hl7.fhir.utilities.json.model.JsonObject;
 import org.hl7.fhir.utilities.npm.FilesystemPackageCacheManager;
 import org.hl7.fhir.utilities.npm.NpmPackage;
 import org.hl7.fhir.utilities.validation.ValidationMessage;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.Collections;
 import org.hl7.fhir.validation.instance.InstanceValidator;
 import org.hl7.fhir.validation.profile.ProfileValidator;
 
@@ -112,12 +114,12 @@ public class PublisherFields {
     List<Resource> loaded = new ArrayList<Resource>();
     ImplementationGuide sourceIg;
     ImplementationGuide publishedIg;
-    List<ValidationMessage> errors = new ArrayList<ValidationMessage>();
+    List<ValidationMessage> errors = Collections.synchronizedList(new ArrayList<ValidationMessage>());
     Set<String> otherFilesStartup = new HashSet<String>();
-    Set<String> otherFilesRun = new HashSet<>();
+    Set<String> otherFilesRun = Collections.newSetFromMap(new ConcurrentHashMap<>());
     Set<String> regenList = new HashSet<String>();
     StringBuilder filelog;
-    Set<String> allOutputs = new HashSet<>();
+    Set<String> allOutputs = Collections.newSetFromMap(new ConcurrentHashMap<>());
     Set<FetchedResource> examples = new HashSet<FetchedResource>();
     Set<FetchedResource> testplans = new HashSet<FetchedResource>();
     Set<FetchedResource> testscripts = new HashSet<FetchedResource>();
@@ -270,7 +272,7 @@ public class PublisherFields {
 
     LanguageSubtagRegistry registry;
 
-    public Map<String, PublisherBase.FragmentUseRecord> fragmentUses = new HashMap<>();
+    public Map<String, PublisherBase.FragmentUseRecord> fragmentUses = new ConcurrentHashMap<>();
 
     LanguageUtils langUtils;
 
@@ -312,7 +314,7 @@ public class PublisherFields {
     @Getter private List<String> exemptHtmlPatterns = new ArrayList<>();
     Resolver.IReferenceResolver resolver;
     @Getter @Setter private boolean languagePack;
-    @Getter @Setter private boolean wcagConformant;
+  @Getter @Setter private boolean wcagConformant;
 
     public String packageId() {
         var ig = publishedIg == null ? sourceIg : publishedIg;

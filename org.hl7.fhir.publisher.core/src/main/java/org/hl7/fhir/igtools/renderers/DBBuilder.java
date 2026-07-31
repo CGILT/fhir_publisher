@@ -322,7 +322,7 @@ public class DBBuilder {
     time(start);
   }
 
-  public void saveResource(FetchedFile f, FetchedResource r, byte[] json) {
+  public synchronized void saveResource(FetchedFile f, FetchedResource r, byte[] json) {
     long start = System.currentTimeMillis();
     if (con == null) {
       return;
@@ -449,7 +449,7 @@ public class DBBuilder {
     return r.getElement().getChildren(name).size() == 1 && r.getElement().getNamedChild(name).isPrimitive() ? r.getElement().getNamedChildValue(name) : defaultValue;
   }
 
-  public void finishResources() {
+  public synchronized void finishResources() {
     long start = System.currentTimeMillis();
     if (con == null) {
       return;

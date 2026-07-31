@@ -429,6 +429,11 @@ public class HTMLInspector {
         }
       }
     }
+    // Free anchor-target sets - not needed after link-checking completes
+    for (LoadedFile lf : cache.values()) {
+      lf.getTargets().clear();
+    }
+
     return messages;
   }
 

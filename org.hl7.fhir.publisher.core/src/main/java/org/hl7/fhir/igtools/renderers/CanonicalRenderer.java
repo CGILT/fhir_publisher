@@ -27,6 +27,11 @@ public class CanonicalRenderer extends BaseRenderer {
 
   private CanonicalResource cr;
   private String destDir;
+
+  /** Reset the underlying canonical resource for renderer reuse. */
+  protected void resetResource(CanonicalResource newCr) {
+    this.cr = newCr;
+  }
   protected String versionToAnnotate;
   protected List<RelatedIG> relatedIgs;
 
