@@ -1775,6 +1775,16 @@ public class PublisherProcessor extends PublisherBase  {
   /**
    * Thread-safe validate: uses per-thread InstanceValidator from threadValidator ThreadLocal.
    * Errors are collected locally and merged into FetchedFile/FetchedResource under synchronization.
+   *
+   * Audited for CGILT#<ConcurrentModificationException fix>: the mutable state this method
+   * touches directly (pf.noValidateResources, file.getErrors(), r.getErrors()) is already
+   * guarded by synchronized blocks below and in processValidationOutcomes(). The
+   * ConcurrentModificationException reported from InstanceValidator.validateElement() ->
+   * Base.addDefinition()/Element.addDefinition() and from
+   * PublisherGenerator.generateOutputsList() -> ContextUtilities.getCanonicalResourceNames()
+   * comes from shared state further down the call stack (org.hl7.fhir.r5.model.Base,
+   * org.hl7.fhir.r5.elementmodel.Element, org.hl7.fhir.r5.context.ContextUtilities in the
+   * org.hl7.fhir.core dependency), not from this method - see the fix there.
    */
   private void validateParallel(FetchedFile file, FetchedResource r) throws Exception {
     if (!passesValidationFilter(r)) {
