@@ -127,7 +127,10 @@ public class StructureDefinitionRenderer extends CanonicalRenderer {
   private List<ElementDefinition> diffElements = null;
   private List<ElementDefinition> mustSupportElements = null;
   private List<ElementDefinition> keyElements = null;
-  private static JsonObject usages;
+  // Shared across all threads/instances (loaded once from the core package, same content
+  // regardless of which SD triggered the load) - see the synchronized lazy-init in
+  // references() below, which guards the check-then-create against concurrent threads.
+  private static volatile JsonObject usages;
   private String specPath;
   private final String packageId;
 
@@ -163,6 +166,19 @@ public class StructureDefinitionRenderer extends CanonicalRenderer {
     sdr.setSdMapCache(sdMapCache);
     sdr.setHostMd(this);
     this.resE = ResourceWrapper.forResource(newGen.getContextUtilities(), newSd);
+    // Clear per-SD memoized caches (see getKeyElements/getMustSupport/getDifferential/
+    // getDifferentialElements/getMustSupportElements below). These are lazily computed
+    // from `this.sd` and cached on this instance; since this renderer is reused across
+    // multiple StructureDefinitions (one instance per thread via
+    // PublisherGenerator.threadLocalSdr, retargeted per-SD via resetFor()), leaving them
+    // set here means the NEXT StructureDefinition processed by this renderer would
+    // silently reuse the PREVIOUS one's cached elements - producing dict-key.xhtml /
+    // snapshot-by-key.xhtml fragments whose content belongs to an unrelated profile.
+    this.differentialHash = null;
+    this.mustSupportHash = null;
+    this.diffElements = null;
+    this.mustSupportElements = null;
+    this.keyElements = null;
   }
 
   public String summary(boolean all) {
@@ -2330,9 +2346,13 @@ public class StructureDefinitionRenderer extends CanonicalRenderer {
     
     if (VersionUtilities.isR5Plus(context.getVersion())) {
       if (usages == null) {
-        FilesystemPackageCacheManager pcm = new FilesystemPackageCacheManager.Builder().build();
-        NpmPackage npm = pcm.loadPackage("hl7.fhir.r5.core");
-        usages = org.hl7.fhir.utilities.json.parser.JsonParser.parseObject(npm.load("other", "sdmap.details"));
+        synchronized (StructureDefinitionRenderer.class) {
+          if (usages == null) {
+            FilesystemPackageCacheManager pcm = new FilesystemPackageCacheManager.Builder().build();
+            NpmPackage npm = pcm.loadPackage("hl7.fhir.r5.core");
+            usages = org.hl7.fhir.utilities.json.parser.JsonParser.parseObject(npm.load("other", "sdmap.details"));
+          }
+        }
       }
       if (usages.has(sd.getUrl())) {
         for (JsonProperty p : usages.getJsonObject(sd.getUrl()).getProperties()) {
